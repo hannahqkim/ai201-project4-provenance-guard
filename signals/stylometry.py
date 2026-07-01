@@ -33,14 +33,32 @@ TTR_AI = 0.40
 PUNCT_HUMAN = 0.12
 PUNCT_AI = 0.04
 
-# Sub-signal weights (sum to 1.0). Variance is the strongest structural tell.
-W_VARIANCE = 0.50
-W_TTR = 0.35
-W_PUNCT = 0.15
+# AI-cliche / formulaic-connective density (matches per sentence). Added in M4 calibration:
+# TTR is inflated on short text and can't flag uniform AI listicles/essays, so this lexical
+# tell does the work at short lengths. High density of these connectives/buzzwords -> AI.
+CLICHE_HUMAN = 0.0
+CLICHE_AI = 0.6
+CLICHE_TERMS = (
+    "furthermore", "moreover", "in conclusion", "in summary", "additionally",
+    "it is important to note", "it is worth noting", "it is essential",
+    "firstly", "secondly", "thirdly", "in today's", "plays a crucial role",
+    "plays a vital role", "plays a significant role", "delve", "navigating the",
+    "a myriad of", "ever-evolving", "paradigm shift", "testament to",
+    "when it comes to", "overall,", "in essence", "notably,",
+)
 
-# Length below which the statistics are unreliable -> lower self_confidence.
-MIN_RELIABLE_WORDS = 80
-MIN_WORDS = 20
+# Sub-signal weights (sum to 1.0). Variance and cliche density are the strongest tells;
+# TTR is down-weighted because it is length-inflated on short passages.
+W_VARIANCE = 0.35
+W_TTR = 0.20
+W_PUNCT = 0.10
+W_CLICHE = 0.35
+
+# Length calibration for self_confidence: statistics are reliable from ~FULL words up,
+# and near-useless below MIN words (a haiku or one-liner).
+FULL_CONF_WORDS = 40   # >= this many words -> full self_confidence
+MIN_WORDS = 10         # <= this many words -> floor self_confidence
+FLOOR_CONF = 0.2
 
 
 def _split_sentences(text):
@@ -92,26 +110,34 @@ def analyze(text):
     ttr = len(set(words)) / n_words
     punct_count = sum(1 for ch in text if ch in string.punctuation)
     punct_density = punct_count / n_words
+    lowered = text.lower()
+    cliche_hits = sum(lowered.count(term) for term in CLICHE_TERMS)
+    cliche_density = cliche_hits / max(len(sentences), 1)
 
     # --- map each metric to an "AI-ness" contribution in [0,1] (1 = looks AI) ---
-    ai_variance = _map_range(stdev_len, STDEV_HUMAN, STDEV_AI)   # low stdev -> high
-    ai_ttr = _map_range(ttr, TTR_HUMAN, TTR_AI)                  # low diversity -> high
-    ai_punct = _map_range(punct_density, PUNCT_HUMAN, PUNCT_AI)  # low density -> high
+    ai_variance = _map_range(stdev_len, STDEV_HUMAN, STDEV_AI)      # low stdev -> high
+    ai_ttr = _map_range(ttr, TTR_HUMAN, TTR_AI)                     # low diversity -> high
+    ai_punct = _map_range(punct_density, PUNCT_HUMAN, PUNCT_AI)     # low density -> high
+    ai_cliche = _map_range(cliche_density, CLICHE_HUMAN, CLICHE_AI)  # more cliches -> high
 
-    p_ai = W_VARIANCE * ai_variance + W_TTR * ai_ttr + W_PUNCT * ai_punct
+    p_ai = (W_VARIANCE * ai_variance + W_TTR * ai_ttr
+            + W_PUNCT * ai_punct + W_CLICHE * ai_cliche)
     p_ai = round(_clamp(p_ai), 4)
 
     # --- self-confidence: statistics are unreliable on short text ---
-    if n_words <= MIN_WORDS:
-        self_conf = 0.2
+    if n_words >= FULL_CONF_WORDS:
+        self_conf = 1.0
+    elif n_words <= MIN_WORDS:
+        self_conf = FLOOR_CONF
     else:
-        self_conf = _clamp((n_words - MIN_WORDS) / (MIN_RELIABLE_WORDS - MIN_WORDS), 0.2, 1.0)
-    self_conf = round(self_conf, 3)
+        self_conf = FLOOR_CONF + (n_words - MIN_WORDS) / (FULL_CONF_WORDS - MIN_WORDS) * (1.0 - FLOOR_CONF)
+    self_conf = round(_clamp(self_conf, FLOOR_CONF, 1.0), 3)
 
     lean = "human" if p_ai < 0.4 else ("AI" if p_ai > 0.6 else "neither strongly")
     note = (
         f"sentence-length stdev={stdev_len:.1f} words, vocab diversity(ttr)={ttr:.2f}, "
-        f"punctuation density={punct_density:.3f} -> structurally leans {lean}"
+        f"punctuation density={punct_density:.3f}, ai-cliche density={cliche_density:.2f}/sentence "
+        f"-> structurally leans {lean}"
     )
     if n_words <= MIN_WORDS:
         note += " (text is short, so this signal is low-confidence)"
@@ -123,6 +149,7 @@ def analyze(text):
             "sentence_len_variance": round(stdev_len, 3),
             "ttr": round(ttr, 4),
             "punct_density": round(punct_density, 4),
+            "cliche_density": round(cliche_density, 4),
         },
         "note": note,
     }

@@ -1,14 +1,12 @@
 """
 Provenance Guard - Flask API.
 
-Milestone 3 scope: POST /submit runs the first detection signal (stylometry),
-returns a structured response with content_id + attribution + placeholder confidence
-+ placeholder label, and writes a structured entry to the SQLite audit log.
-GET /log surfaces recent entries.
+Milestone 4 scope: POST /submit runs BOTH detection signals - stylometry (structural)
+and the Groq LLM classifier (semantic) - and fuses them into a real calibrated
+confidence score + attribution (scoring.py). The audit log now records both individual
+signal scores alongside the combined confidence. GET /log surfaces recent entries.
 
-Confidence fusion (M4) and the real transparency labels + appeals + rate limiting
-(M5) are added in later milestones; they are marked as PLACEHOLDER below so the
-seams are obvious.
+The real transparency labels + appeals + rate limiting (M5) are still PLACEHOLDER below.
 """
 
 import uuid
@@ -17,7 +15,8 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 
 import audit
-from signals import stylometry
+import scoring
+from signals import llm, stylometry
 
 load_dotenv()
 
@@ -25,31 +24,20 @@ app = Flask(__name__)
 audit.init_db()
 
 
-# --- PLACEHOLDER helpers (replaced in M4/M5) -------------------------------------
+# --- PLACEHOLDER helper (real transparency labels arrive in M5) -------------------
 
-def _placeholder_attribution(p_ai):
-    """Provisional single-signal verdict until M4 fusion. Asymmetric bands come in M4."""
-    if p_ai >= 0.6:
-        return "likely_ai"
-    if p_ai <= 0.4:
-        return "likely_human"
-    return "uncertain"
-
-
-def _placeholder_confidence(p_ai, self_confidence):
-    """Placeholder until M4: distance-from-0.5, damped by the signal's self-confidence."""
-    return round(abs(p_ai - 0.5) * 2 * self_confidence, 2)
-
-
-def _placeholder_label(attribution):
-    return f"[placeholder label - real transparency text arrives in M5] attribution={attribution}"
+def _placeholder_label(attribution, tier):
+    return (
+        f"[placeholder label - real transparency text arrives in M5] "
+        f"attribution={attribution}, confidence_tier={tier}"
+    )
 
 
 # --- routes ----------------------------------------------------------------------
 
 @app.get("/")
 def health():
-    return jsonify({"service": "provenance-guard", "status": "ok", "milestone": 3})
+    return jsonify({"service": "provenance-guard", "status": "ok", "milestone": 4})
 
 
 @app.post("/submit")
@@ -64,24 +52,31 @@ def submit():
 
     content_id = str(uuid.uuid4())
 
-    # Signal 1 - stylometry (structural).
+    # Two independent signals: structural + semantic.
     stylo = stylometry.analyze(text)
+    llm_result = llm.analyze(text)
 
-    # PLACEHOLDER attribution/confidence/label (single signal only in M3).
-    attribution = _placeholder_attribution(stylo["p_ai"])
-    confidence = _placeholder_confidence(stylo["p_ai"], stylo["self_confidence"])
-    label = _placeholder_label(attribution)
+    # Fuse into a calibrated confidence score + attribution (planning.md sec.3).
+    decision = scoring.score(stylo, llm_result)
+    attribution = decision["attribution"]
+    confidence = decision["confidence"]
+    label = _placeholder_label(attribution, decision["confidence_tier"])
 
     timestamp = audit.utc_now_iso()
+    signals = {"stylometry": stylo, "llm": llm_result}
     entry = {
         "content_id": content_id,
         "creator_id": creator_id,
         "timestamp": timestamp,
         "attribution": attribution,
         "confidence": confidence,
+        "ai_likelihood": decision["ai_likelihood"],
+        "agreement": decision["agreement"],
         "stylometry_score": stylo["p_ai"],
+        "llm_score": llm_result.get("p_ai"),
+        "llm_available": decision["llm_available"],
         "status": "classified",
-        "signals": {"stylometry": stylo},
+        "signals": signals,
         "text_excerpt": str(text)[:160],
     }
     audit.log_classification(entry)
@@ -91,9 +86,12 @@ def submit():
             "content_id": content_id,
             "creator_id": creator_id,
             "attribution": attribution,
+            "ai_likelihood": decision["ai_likelihood"],
             "confidence": confidence,
+            "confidence_tier": decision["confidence_tier"],
+            "agreement": decision["agreement"],
             "label": label,
-            "signals": {"stylometry": stylo},
+            "signals": signals,
             "status": "classified",
             "timestamp": timestamp,
         }
